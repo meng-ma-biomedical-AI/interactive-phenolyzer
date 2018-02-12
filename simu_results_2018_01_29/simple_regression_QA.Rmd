@@ -1,0 +1,437 @@
+---
+title: "Simple Demo of QA"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Question Statement
+
+Suppose we have trained a multiclassify model M. We then have a testing sample $(X_i,y_i)$. Unfortunately, in a clinical practice, it is very likely there are a lot of missing pieces in patients' record when a doctor or genetic counselor first obtained the patients' notes. Thus the testing sample is $(X_i^{(obs)},y_i)$.
+
+In this study we will compare the results of three methods in terms of testing accuracy
+- complete testing sample $(X_i,y_i)$. This is the upbound accuracy we could achieve
+- missing sample, $(X_i^{(obs)},y_i)$, where the missing part in $X_i$ is imputed using the mean of training sample.
+- missing sample, $(X_i^{(obs)},y_i)$, where the certain percent of missing pierce will be completed through a static QA system. 
+- missing sample, $(X_i^{(obs)},y_i)$, where the certain percent of missing pierce will be completed through a dynamic QA system. 
+
+## Part 1: dataset simulation
+
+- We simulate a complete dataset first. $X$ is a $P*N$ matrix. Only binary category for simplicity. 
+- Weight $W$ is a $K*P$ matrix.
+- For each sample, calculate probability $p$ as a $K*1$ vector using softmax. And $y$ is sampled according to the probability.
+- The dataset then split into half trainig and half testing.
+- Introduce $NA$ for each sample according to the $missing_rate$ in the testing set.
+
+```{r}
+library("dplyr")    # for some data preperation
+library("entropy") # only retain high entropy results.
+
+set.seed(1)
+N = 1000
+num_train = ceiling(N/2)
+P = 50
+K = 10
+missing_rate = 0.5
+ans_rate = 0.5 # if 5 of 10 is missing. then 1 questions could be answered.
+top_n <- c(1,3,5)
+
+# define softmax function.
+
+softmax <- function(W,x){
+  # W: weight matrix
+  # x: sample matrix
+  
+  # z: vector of net input.
+  z = W %*% x
+  e_z = exp(z)
+  sum_e_z = sum(e_z)
+  
+  # p: vector of probability for each class
+  p = e_z/sum_e_z
+  return (p)
+}
+complete_X = replicate(N,rbinom(n = P,size = 1,prob = 0.5)) # P*N
+W = replicate(P,runif(min = -0.5,max = 0.5,n = K)) # K*P
+prob = apply(X = complete_X,MARGIN = 2,softmax,W=W)
+y = apply(prob,MARGIN = 2,function(x) sample(x = (1:K),size = 1,prob = x))
+# hard-encode y for xgboost
+y = as.factor(paste("c",y,sep = ""))
+
+if(entropy(table(y))
+ < 2){
+  stop("Entropy less than 2")
+ }
+
+
+# check result
+# z1 = W %*% complete_X[,1] # K*P %*% P * 1 = K * 1
+# p1 = sapply(z1,function(x) exp(x)/sum(exp(z1)))
+# p1
+# prob[,1]
+# y[1:5]
+# prob[,1:5]
+# sum(is.na(testing_x_obs))/(500*100)
+# Bingo !
+```
+
+## Part 2: train a XGBoost model.
+- Alternatively, we could train other boosting tree based method. (i.e. exclude the trees with NA nodes)
+- Generate overall feature importance matrix.
+```{r}
+library(caret)
+library(xgboost)
+dat <- data.frame(Class=y,t(complete_X))
+dat$Class <- as.numeric(dat$Class)
+dat <- dat %>% mutate(Class = Class - 1)
+
+# Make split index
+train_index <- sample(1:nrow(dat), num_train)
+# Full data set
+data_variables <- data.matrix(data.frame(lapply(dat[,-1], as.numeric)))
+data_label <- dat[,"Class"]
+data_matrix <- xgb.DMatrix(data = as.matrix(dat), label = data_label)
+# split train data and make xgb.DMatrix
+train_data   <- data_variables[train_index,]
+train_label  <- data_label[train_index]
+train_matrix <- xgb.DMatrix(data = train_data, label = train_label)
+# split test data and make xgb.DMatrix
+test_data  <- data_variables[-train_index,]
+test_label <- data_label[-train_index]
+test_matrix <- xgb.DMatrix(data = test_data, label = test_label)
+mask = replicate(n = num_train,sample(x = c(NA,1),size = P,replace = T,prob = c(missing_rate,1 - missing_rate))) %>% t()
+numberOfClasses <- length(unique(dat$Class))
+xgb_params <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses)
+nround    <- 50 # number of XGBoost rounds
+bst_model <- xgb.train(params = xgb_params,
+                       data = train_matrix,
+                       nrounds = nround)
+```
+
+## Part 3: Upper-bound accuracy. complete set prediction.
+- we count the frequency of true class appearing in the top $N$ position in the prediction list ordered descendantly according to the prediction probability.  
+
+```{r}
+testEval <- function(predict_prob,true_class,top_n){
+  # predict_prob: testing_num * K matrix
+  # true_class: testing_num vector
+  # top_n: count true postitive if trueClass ranked topN in predict_prob.
+  # a vector or a number.
+  
+  for_test <- cbind(true_class,predict_prob)
+  position_for_true <- apply(for_test,MARGIN = 1, function(x) {
+    which(names(sort(x[-1],decreasing = T)) %in% 
+            paste("X",as.character(unlist(x[1])),sep="")
+          )
+  })
+  # Add na.rm=TRUE in case the testing class is not covered in training, though it is unlikely.
+  top_rate <- function(x) sum(as.numeric(position_for_true) <= x,na.rm = TRUE)/length(position_for_true)
+  return (data.frame(top_n=top_n,rate=mapply(top_rate,top_n)))
+}
+# test for training sample. 
+# test_pred <- predict(bst_model, newdata = train_matrix)
+# test_prediction <- matrix(test_pred, nrow = numberOfClasses,
+#                           ncol=length(test_pred)/numberOfClasses) %>%
+#   t() %>%
+#   data.frame() %>%
+#   mutate(label = train_label + 1,
+#          max_prob = max.col(., "last"))
+# u = union(factor(test_prediction$label), factor(test_prediction$max_prob))
+# t = table(factor(factor(test_prediction$max_prob), u), factor(factor(test_prediction$label), u))
+# confusionMatrix(t)
+# bingoo!
+test_pred_1 <- predict(bst_model, newdata = test_matrix)
+test_prediction_1 <- matrix(test_pred_1, nrow = numberOfClasses,
+                          ncol=length(test_pred_1)/numberOfClasses) %>%
+   t() %>%
+   data.frame()
+
+eval_matrix_1 <- testEval(test_prediction_1,true_class = test_label + 1,top_n)
+
+```
+
+## Part 4: Lower-bound accuracy. missing set prediction.
+- predicting with missing values.
+```{r}
+# add missing pierce in testing.
+test_data_na = mask * test_data
+test_matrix_na <- xgb.DMatrix(data = test_data_na, label = test_label)
+# mean(apply(test_data_na,1,function(x) sum(is.na(x))))
+test_pred_2 <- predict(bst_model, newdata = test_matrix_na,missing = NA)
+test_prediction_2 <- matrix(test_pred_2, nrow = numberOfClasses,
+                          ncol=length(test_pred_2)/numberOfClasses) %>%
+   t() %>%
+   data.frame()
+
+eval_matrix_2 <- testEval(test_prediction_2,true_class = test_label + 1,top_n)
+
+```
+
+## Part 5: random selection.
+- randomly fill out the missing slot for each testing sample.
+```{r}
+
+# define mask update function.
+maskUpdator <- function(mask,feature_sort,size=NULL,ans_rate){
+  # mask: a matrix num_test*P containig 1 or NA.
+  # feature: a vector containing the sorted features.
+  # ans_rate: a scalar indicating the ratio of NA should be filled for each sample.
+  # size: a scalar indicating the number of NA should be filled.
+  
+  if(is.null(dim(mask))){
+    # update mask for individual.
+    mask = matrix(mask,nrow = 1)
+  }
+  if (is.null(size)){
+    mask_after <- mask
+    mask_after <- apply(mask_after, MARGIN = 1, function(x){
+      y = x
+      na_index = which(is.na(x))
+      size = ceiling(sum(is.na(x)) * ans_rate)
+      na_sort = na_index[order(match(na_index,feature_sort))]
+      num_ans_index = na_sort[1:size]
+      y[num_ans_index] = 1
+      return(y)
+    }) %>% t()
+  }else{
+    mask_after <- mask
+    mask_after <- apply(mask_after, MARGIN = 1, function(x){
+      y = x
+      na_index = which(is.na(x))
+      na_sort = na_index[order(match(na_index,feature_sort))]
+      num_ans_index = na_sort[1:size]
+      y[num_ans_index] = 1
+      return(y)
+    }) %>% t()
+  }
+}
+
+feature_random_sort <- sample(1:P,size = P,replace = F)
+mask_after_qa_rand <- maskUpdator(mask = mask,feature_sort = feature_random_sort,ans_rate=ans_rate)
+
+
+# for test purpose.
+# a = matrix(1:10,2,5)
+# a
+# apply(a,1,function(x){
+#   b = x
+#   b[2] = NA
+#   return(b)
+# }) %>% t()
+
+test_data_na_rand = mask_after_qa_rand * test_data
+test_matrix_qa_rand <- xgb.DMatrix(data = test_data_na_rand, label = test_label)
+# mean(apply(test_data_na_rand,1,function(x) sum(is.na(x))))
+
+test_pred_3 <- predict(bst_model, newdata = test_matrix_qa_rand,missing = NA)
+test_prediction_3 <- matrix(test_pred_3, nrow = numberOfClasses,
+                          ncol=length(test_pred_3)/numberOfClasses) %>%
+   t() %>%
+   data.frame()
+
+eval_matrix_3 <- testEval(test_prediction_3,true_class = test_label + 1,top_n)
+
+
+```
+
+## Part 6: select top features from the complete training set.
+- For each sample, we select the most important features to answer, if this feature is already answered, we will move to next.
+- Feature importance are measured by the original bst_model using accuracy gain.
+- To make the comparison fair, make sure the number of na answered keeps the same.
+```{r}
+# define entropy related functions.
+entropyHelper <- function(x, unit = "log2") {
+  # x: a vector containing the class label.
+  # unit: "log2" or other entropy function related log type.
+  
+  return(entropy(table(x, useNA="always"), unit = unit))
+}
+entropyGenerator <- function(data,unit = "log2"){
+  # data: a data frame. each row is a sample, with first column as lables.
+  # unit "log2" or other entropy function compatible log type.
+  attr_entropies = sapply(data, entropyHelper, "log2")
+  class_entropy = attr_entropies[1]
+  attr_entropies = attr_entropies[-1]
+  joint_entropies = sapply(data[-1], function(t) {
+    entropyHelper(data.frame(cbind(data[[1]], t)), "log2")
+  })
+  results = class_entropy + attr_entropies - joint_entropies
+  return (results)
+}
+
+train_origin <- data.frame(train_label,train_data)
+feature_importance <- entropyGenerator(train_origin)
+feature_complete_sort <- order(feature_importance,decreasing = TRUE)
+mask_after_qa_whole <- maskUpdator(mask = mask,feature_sort = feature_complete_sort,ans_rate=ans_rate)
+
+test_data_na_whole = mask_after_qa_whole * test_data
+test_matrix_qa_whole <- xgb.DMatrix(data = test_data_na_whole, label = test_label)
+# mean(apply(test_data_na_whole, 1, function(x) sum(is.na(x))))
+test_pred_4 <- predict(bst_model, newdata = test_matrix_qa_whole,missing = NA)
+test_prediction_4 <- matrix(test_pred_4, nrow = numberOfClasses,
+                          ncol=length(test_pred_4)/numberOfClasses) %>%
+   t() %>%
+   data.frame()
+
+eval_matrix_4 <- testEval(test_prediction_4,true_class = test_label + 1,top_n)
+
+```
+
+## Part 7: select features customized
+- We first reduce the candidate class to $K_reduced$
+- Then we re-evaluate the feature importances given $K_reduced$ class.
+- We ra-rank the features based on accuracy gain in new model.
+- Answer the questions (i.e. fill the features based on its new important)
+- Remaining Issue:
+- How to tune reduce ratio.
+
+```{r}
+reduce_ratio <- 0.8
+test_prediction_4_step1 <- test_prediction_2
+K_reduced = ceiling(reduce_ratio*K)
+# define train set reduction function
+reduceTrain <- function(train_data, test_prediction,K_reduced){
+  # train_data: a data frame. Original train_data, the first_colname should be train_label.
+  # test_prediction: a vector contain test features.
+  # K_reduced: a scalar. number of reduced classes.
+
+  reduced_class = order(test_prediction,decreasing = TRUE)[1:K_reduced] - 1
+  train_index_2 = which(train_data$train_label %in% reduced_class)
+  train_reduced = train_data[train_index_2,]
+  return (train_reduced)
+}
+
+# an example for one testing.
+
+mask_after_qa_cust = mask
+for(i in 1:dim(test_data)[1]){
+  test_prediction = test_prediction_4_step1[i,]
+  train_data_step2 <- reduceTrain(train_data = train_origin, test_prediction = test_prediction,K_reduced = K_reduced)
+  new_feature_importance <- entropyGenerator(train_data_step2)
+  new_feature_order <- order(new_feature_importance,decreasing = TRUE)
+  # update mask.
+  size = ceiling(sum(is.na(mask[i,])) * ans_rate)
+  mask_after_qa_cust[i,] = maskUpdator(mask[i,],new_feature_order,size = size)
+}
+  
+test_data_na_cust = mask_after_qa_cust * test_data
+test_matrix_qa_cust <- xgb.DMatrix(data = test_data_na_cust, label = test_label)
+test_pred_5 <- predict(bst_model, newdata = test_matrix_qa_cust,missing = NA)
+test_prediction_5 <- matrix(test_pred_5, nrow = numberOfClasses,
+                          ncol=length(test_pred_5)/numberOfClasses) %>%
+   t() %>%
+   data.frame()
+
+eval_matrix_5 <- testEval(test_prediction_5,true_class = test_label + 1,top_n)
+```
+
+## Part 8: select features step-wise customized
+- Fill out the top feature based on the original set.
+- round 1 prediction.
+- update feature importance.
+- fill out the top feature based on the reduced set.
+- repeat until total number of question answered.
+
+- Remaining Issue:
+- very slow. But we could control the batch size to make it fast. Currently takes ~5mins
+- compare w/ cust. if forcus on top1 then shrink quickly.
+- update_rate should be determined by missing rate.
+- more missing, slow update.
+```{r}
+
+update_rate = 0.9 # each iter the traininig class number will reduce by.
+# each iter the number of NA will fill by.
+test_prediction_6 = test_prediction_2 # init result matrix.
+mask_after_qa_sw = mask # init mask.
+for(i in 1:dim(test_data)[1]){
+  update_size = 3
+  total_qa_size = ceiling(sum(is.na(mask[i,])) * ans_rate)
+  # init.
+  # init the remaining size of NA to fill out. 
+  size_working = total_qa_size
+  # init the mask.
+  mask_working = mask_after_qa_sw[i,]
+  # init the class number.
+  K_working = K
+  # init the training set
+  training_working = train_origin
+  # init the fature importance vector
+  feature_sort_working = feature_complete_sort
+  # init the test data.
+  test_data_working = test_data_na[i,]
+  # init the pred result.
+  pred_result_working = test_prediction_6[i,]
+  # init test label. It won't change.
+  test_label_working = test_label[i]
+  
+  while(size_working > 0){
+    
+    # update size
+    size_working = size_working - update_size
+    # update training set.
+    training_working = reduceTrain(training_working,pred_result_working,K_working)
+    # update mask
+    feature_sort_tmp = entropyGenerator(training_working)
+    feature_order_tmp <- order(feature_sort_tmp,decreasing = TRUE)
+    if(size_working < 0){
+      update_size = update_size + size_working
+    }
+    mask_working <- maskUpdator(mask = mask_working,feature_sort = feature_order_tmp,size = update_size)
+    # update test data
+    test_data_working <- mask_working * test_data[i,]
+    # update prediction result
+    test_xgb_mat <- xgb.DMatrix(data = test_data_working, label = test_label_working)
+    pred_xgb <- predict(bst_model, newdata = test_xgb_mat,missing = NA)
+    pred_result_working <- matrix(pred_xgb, nrow = numberOfClasses,ncol=length(pred_xgb)/numberOfClasses) %>%
+       t() %>%
+       data.frame()
+    
+    # update class number. Using floor() to make sure the update is moving.
+    K_working = floor(K_working * update_rate)
+
+  }
+  # summarize the result for one sample.
+  mask_after_qa_sw[i,] = mask_working
+  test_prediction_6[i,] = pred_result_working
+}
+
+eval_matrix_6 <- testEval(test_prediction_6,true_class = test_label + 1,top_n)
+
+
+```
+
+## Part 9: a summarize for one simulation results.
+
+```{r}
+library(tidyr)
+library(ggplot2)
+
+top_n <- c(1,2,3,4,5)
+eval_matrix_1 <- testEval(test_prediction_1,true_class = test_label + 1,top_n)
+eval_matrix_2 <- testEval(test_prediction_2,true_class = test_label + 1,top_n)
+eval_matrix_3 <- testEval(test_prediction_3,true_class = test_label + 1,top_n)
+eval_matrix_4 <- testEval(test_prediction_4,true_class = test_label + 1,top_n)
+eval_matrix_5 <- testEval(test_prediction_5,true_class = test_label + 1,top_n)
+eval_matrix_6 <- testEval(test_prediction_6,true_class = test_label + 1,top_n)
+
+
+df <- data.frame(eval_matrix_1,eval_matrix_2[,-1],eval_matrix_3[,-1],
+           eval_matrix_4[,-1],eval_matrix_5[,-1],eval_matrix_6[,-1])
+colnames(df)[-1] <- c("6-complete","1-NA","2-rand","3-global","4-cust","5-dynam")
+df %>% 
+  gather(class,rate,-top_n) %>% 
+  ggplot(aes(x = top_n,y = rate,fill=class)) +
+  geom_bar(stat="identity", color="black", position=position_dodge()) + 
+  theme_minimal() + scale_x_discrete(limits = c(1,2,3,4,5)) +
+  ggtitle("Comparison between different methods") + 
+  theme(plot.title = element_text(hjust = 0.5)) +
+  xlab("Top N") + 
+  ylab("Percentage of Cases (500) within Rank %")
+  
+```
+
+
